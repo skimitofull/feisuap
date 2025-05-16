@@ -1,65 +1,131 @@
 import streamlit as st
-from PIL import Image
+import cv2
+import dlib
 import numpy as np
-import face_recognition
+from PIL import Image
+import os
 
-def replace_faces(base_img, face_img, scale_factor, x_offset, y_offset):
-    # Convertir imágenes a arrays numpy
-    base_img_np = np.array(base_img)
-    face_img_np = np.array(face_img)
+# Configuración inicial
+st.set_page_config(page_title="Reemplazo de Caras", layout="wide")
+st.title("Reemplazo de Caras en Imágenes")
 
-    # Detectar ubicaciones de caras en la imagen base
-    face_locations = face_recognition.face_locations(base_img_np)
+# Descargar el modelo de dlib
+def download_shape_predictor():
+    import urllib.request
+    predictor_url = "http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+    predictor_path = "shape_predictor_68_face_landmarks.dat"
 
-    if not face_locations:
-        st.warning("No se detectaron caras en la imagen base.")
-        return base_img
+    if not os.path.exists(predictor_path):
+        st.info("Descargando modelo de reconocimiento facial...")
+        urllib.request.urlretrieve(predictor_url, predictor_path + ".bz2")
 
-    # Redimensionar la imagen de la cara a poner para que encaje en cada cara detectada
-    for (top, right, bottom, left) in face_locations:
-        face_width = right - left
-        face_height = bottom - top
+        import bz2
+        with bz2.BZ2File(predictor_path + ".bz2", "rb") as f_in:
+            with open(predictor_path, "wb") as f_out:
+                f_out.write(f_in.read())
+        os.remove(predictor_path + ".bz2")
 
-        # Calcular el nuevo tamaño de la cara basada en el factor de escala
-        new_face_width = int(face_width * scale_factor)
-        new_face_height = int(face_height * scale_factor)
+    return predictor_path
 
-        # Redimensionar la cara a poner
-        face_resized = face_img.resize((new_face_width, new_face_height))
-        face_resized_np = np.array(face_resized)
+# Función para detectar caras automáticamente
+def detect_faces_auto(image, predictor_path):
+    detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor(predictor_path)
 
-        # Calcular la posición ajustada con los offsets
-        x_pos = left + x_offset
-        y_pos = top + y_offset
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    faces = detector(gray)
 
-        # Asegurarse de que la cara no se salga de los límites de la imagen
-        x_pos = max(0, min(x_pos, base_img_np.shape[1] - new_face_width))
-        y_pos = max(0, min(y_pos, base_img_np.shape[0] - new_face_height))
+    landmarks = []
+    for face in faces:
+        shape = predictor(gray, face)
+        landmarks.append(np.array([[p.x, p.y] for p in shape.parts()], dtype=np.int32))
 
-        # Reemplazar la cara en la imagen base
-        base_img_np[y_pos:y_pos + new_face_height, x_pos:x_pos + new_face_width] = face_resized_np
+    return faces, landmarks
 
-    # Convertir de nuevo a imagen PIL
-    result_img = Image.fromarray(base_img_np)
-    return result_img
+# Función para reemplazar caras
+def replace_faces(image, replacement_img, faces, landmarks, mode="auto"):
+    result = image.copy()
 
-st.title("Reemplazo de caras en imágenes")
+    for i, (face, landmark) in enumerate(zip(faces, landmarks)):
+        if mode == "auto":
+            (x, y, w, h) = (face.left(), face.top(), face.width(), face.height())
+        else:  # modo manual
+            (x, y, w, h) = face
 
-uploaded_base = st.file_uploader("Sube la imagen base", type=["jpg", "jpeg", "png"])
-uploaded_face = st.file_uploader("Sube la imagen de la cara para reemplazar", type=["jpg", "jpeg", "png"])
+        # Redimensionar imagen de reemplazo
+        replacement = cv2.resize(replacement_img, (w, h))
 
-if uploaded_base and uploaded_face:
-    base_img = Image.open(uploaded_base).convert("RGB")
-    face_img = Image.open(uploaded_face).convert("RGB")
+        # Crear máscara
+        if mode == "auto":
+            mask = np.zeros(replacement.shape[:2], dtype=np.uint8)
+            cv2.convexHull(landmark, returnPoints=True)
+            cv2.fillConvexPoly(mask, landmark, 255)
+        else:
+            mask = np.ones(replacement.shape[:2], dtype=np.uint8) * 255
 
-    st.image(base_img, caption="Imagen base", use_column_width=True)
-    st.image(face_img, caption="Imagen de la cara a poner", use_column_width=True)
+        # Aplicar reemplazo
+        replacement = cv2.bitwise_and(replacement, replacement, mask=mask)
+        inv_mask = cv2.bitwise_not(mask)
+        face_region = result[y:y+h, x:x+w]
+        face_region = cv2.bitwise_and(face_region, face_region, mask=inv_mask)
+        combined = cv2.add(face_region, replacement)
+        result[y:y+h, x:x+w] = combined
 
-    # Controles deslizantes para ajustar la escala y la posición
-    scale_factor = st.slider("Factor de escala", min_value=0.1, max_value=2.0, value=1.0, step=0.05)
-    x_offset = st.slider("Desplazamiento horizontal", min_value=-100, max_value=100, value=0, step=1)
-    y_offset = st.slider("Desplazamiento vertical", min_value=-100, max_value=100, value=0, step=1)
+    return result
 
-    if st.button("Reemplazar caras"):
-        result = replace_faces(base_img, face_img, scale_factor, x_offset, y_offset)
-        st.image(result, caption="Imagen con caras reemplazadas", use_column_width=True)
+# Interfaz de usuario
+uploaded_file = st.file_uploader("Sube una imagen para detectar caras", type=["jpg", "jpeg", "png"])
+replacement_file = st.file_uploader("Sube la imagen de reemplazo", type=["jpg", "jpeg", "png"])
+
+if uploaded_file is not None and replacement_file is not None:
+    # Cargar imágenes
+    original_image = np.array(Image.open(uploaded_file))
+    replacement_image = np.array(Image.open(replacement_file))
+    original_image = cv2.cvtColor(original_image, cv2.COLOR_RGB2BGR)
+    replacement_image = cv2.cvtColor(replacement_image, cv2.COLOR_RGB2BGR)
+
+    # Selección de modo
+    mode = st.radio("Modo de operación:", ("Automático", "Manual"))
+
+    if mode == "Automático":
+        predictor_path = download_shape_predictor()
+        faces, landmarks = detect_faces_auto(original_image, predictor_path)
+
+        if len(faces) > 0:
+            st.success(f"Se detectaron {len(faces)} caras en la imagen")
+            result_image = replace_faces(original_image, replacement_image, faces, landmarks, "auto")
+        else:
+            st.warning("No se detectaron caras. Prueba el modo manual.")
+            result_image = original_image.copy()
+    else:  # Modo manual
+        st.info("Selecciona la región de la cara en la imagen")
+
+        # Mostrar imagen para selección
+        display_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+        st.image(display_image, caption="Selecciona la región de la cara", use_column_width=True)
+
+        # Coordenadas de selección
+        x = st.slider("Posición X", 0, original_image.shape[1], original_image.shape[1]//2)
+        y = st.slider("Posición Y", 0, original_image.shape[0], original_image.shape[0]//2)
+        w = st.slider("Ancho", 10, min(300, original_image.shape[1]-x), 150)
+        h = st.slider("Alto", 10, min(300, original_image.shape[0]-y), 150)
+
+        # Crear datos para el reemplazo
+        faces = [(x, y, w, h)]
+        landmarks = [np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]])]  # Rectángulo simple
+        result_image = replace_faces(original_image, replacement_image, faces, landmarks, "manual")
+
+    # Mostrar resultados
+    col1, col2 = st.columns(2)
+    with col1:
+        st.image(cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB), caption="Original", use_column_width=True)
+    with col2:
+        st.image(cv2.cvtColor(result_image, cv2.COLOR_BGR2RGB), caption="Modificada", use_column_width=True)
+
+    # Opción para descargar
+    st.download_button(
+        label="Descargar imagen modificada",
+        data=cv2.imencode(".jpg", result_image)[1].tobytes(),
+        file_name="imagen_modificada.jpg",
+        mime="image/jpeg"
+    )
